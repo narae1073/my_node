@@ -1,7 +1,18 @@
 const express = require("express");
 const router = express.Router();
 const db = require("./db"); // 위에서 만든 db.js 불러오기
-
+const getPhotoMetadata = require("./exifExtractor");
+const path = require("path");
+const multer = require("multer");
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "uploads/"); // 'uploads' 폴더에 저장
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + path.extname(file.originalname)); // 이름 중복 방지
+  },
+});
+const upload = multer({ storage: storage });
 console.log("routes loaded");
 
 /**
@@ -32,18 +43,74 @@ console.log("routes loaded");
  *                     type: string
  *                     format: date-time
  */
+// routes.js의 게시판 목록 조회 라우터 수정
+
+// 셔터스피드 소수를 분수 형태로 예쁘게 바꿔주는 함수
+function formatShutterSpeed(shutterSpeed) {
+  if (!shutterSpeed) return "정보 없음";
+
+  const num = parseFloat(shutterSpeed);
+  if (isNaN(num)) return shutterSpeed; // 혹시 이미 문자열이면 그대로 반환
+
+  if (num >= 1) {
+    // 1초 이상인 경우 (예: 1초, 2초, 30초 등 야경 촬영)
+    return num + "초";
+  } else {
+    // 1초 미만인 경우 (예: 0.004 -> 1/250)
+    // 1을 소수로 나누고 반올림(Math.round)하면 분모가 나와!
+    const denominator = Math.round(1 / num);
+    return `1/${denominator}초`;
+  }
+}
+
+// 게시판 목록 라우터
 router.get("/posts", (req, res) => {
-  const sql = "SELECT * FROM posts ORDER BY created_at DESC"; // 최신글이 위로 오도록 정렬
+  const sql = `
+        SELECT p.*, m.aperture, m.shutter_speed, m.iso, m.taken_at, m.camera_model, m.focal_35mm 
+        FROM posts p
+        LEFT JOIN photo_metadata m ON p.id = m.post_id 
+        ORDER BY p.created_at DESC
+    `;
 
   db.query(sql, (err, results) => {
     if (err) {
       console.error(err);
-      return res
-        .status(500)
-        .json({ error: "데이터베이스 조회 중 에러가 발생했습니다." });
+      return res.status(500).send("데이터 가져오기 실패");
     }
-    // 성공 시 조회된 게시글 목록(배열)을 JSON 형태로 응답
-    res.json(results);
+
+    let html = "<h1>사진 게시판</h1>";
+    html += '<a href="/">홈으로</a><hr>';
+
+    results.forEach((post) => {
+      const takenDate = post.taken_at
+        ? new Date(post.taken_at).toLocaleString("ko-KR")
+        : "정보 없음";
+
+      // 👈 여기서 방금 만든 함수로 셔터스피드를 변환해줘!
+      const formattedShutter = formatShutterSpeed(post.shutter_speed);
+
+      html += `
+                <div style="border:1px solid #ccc; margin:15px; padding:15px; border-radius: 8px; max-width: 1080px;">
+                    <h3>${post.title}</h3>
+                    <img src="${post.image_path}" width="100%" style="border-radius: 4px;"><br>
+                    <p style="margin: 10px 0;">${post.content}</p>
+                    
+                    <div style="background-color: #f5f5f5; padding: 10px; border-radius: 5px; font-size: 0.85em; color: #444; line-height: 1.6;">
+                        <strong style="color: #000;">📸 촬영 정보 (EXIF)</strong><br>
+                        • 카메라 모델: ${post.camera_model || "정보 없음"}<br>
+                        • 화각 (35mm 환산): ${post.focal_35mm ? post.focal_35mm + "mm" : "정보 없음"}<br>
+                        • 조리개값: ${post.aperture ? "f/" + post.aperture : "정보 없음"}<br>
+                        • 셔터스피드: ${formattedShutter}<br> • ISO: ${post.iso || "정보 없음"}<br>
+                        • 촬영 일시: ${takenDate}
+                    </div>
+                    
+                    <hr style="border: 0; border-top: 1px dashed #eee; margin: 10px 0;">
+                    <small style="color: #aaa;">업로드일: ${new Date(post.created_at).toLocaleString("ko-KR")}</small>
+                </div>
+            `;
+    });
+
+    res.send(html);
   });
 });
 
@@ -143,35 +210,52 @@ router.get("/posts/:id", (req, res) => {
  *       400:
  *         description: 필수값 누락
  */
-router.post("/posts", (req, res) => {
-  // 1. 사용자가 보낸 데이터를 '구조 분해 할당'으로 꺼내옴
-  const { title, content, author } = req.body;
+router.post("/upload", upload.single("photo"), async (req, res) => {
+  const filename = req.file.filename;
+  const title = filename.split(".")[0];
+  const imagePath = `/uploads/${filename}`;
 
-  // 2. 필수 데이터가 누락되었는지 확인하는 예외 처리 (방어 코드)
-  if (!title || !content || !author) {
-    return res
-      .status(400)
-      .json({ message: "제목, 내용, 작성자는 필수 입력 항목입니다." });
-  }
+  const sql = "INSERT INTO posts (title, content, image_path) VALUES (?, ?, ?)";
 
-  // 3. MySQL에 데이터를 안전하게 집어넣기 위한 SQL 문 (물음표 3개!)
-  const sql = "INSERT INTO posts (title, content, author) VALUES (?, ?, ?)";
+  // 주의: 여기도 async!
+  db.query(
+    sql,
+    [title, "내용을 입력하세요", imagePath],
+    async (err, result) => {
+      if (err) {
+        return res.status(500).send("DB 저장 실패");
+      }
 
-  // 4. 대괄호 안에 변수를 순서대로 담아서 쿼리 실행
-  db.query(sql, [title, content, author], (err, result) => {
-    if (err) {
-      console.error(err);
-      return res
-        .status(500)
-        .json({ error: "데이터베이스 저장 중 에러가 발생했습니다." });
-    }
+      const postId = result.insertId; // 방금 생성된 글 번호
 
-    // 5. 성공 시 생성된 게시글의 고유 id를 포함하여 211(Created) 상태 코드로 응답
-    res.status(211).json({
-      message: "게시글이 성공적으로 등록되었습니다.",
-      postId: result.insertId, // MySQL이 자동으로 부여해준 id 값이야!
-    });
-  });
+      // --- [메타데이터 추출 및 저장 로직 시작] ---
+      const filePath = path.join(__dirname, "uploads", filename);
+      const metadata = await getPhotoMetadata(filePath);
+
+      if (metadata) {
+        const metaSql =
+          "INSERT INTO photo_metadata (post_id, aperture, shutter_speed, iso, taken_at, camera_model, focal_35mm) VALUES (?, ?, ?, ?, ?, ?, ?)";
+        db.query(
+          metaSql,
+          [
+            postId,
+            metadata.aperture,
+            metadata.shutter_speed,
+            metadata.iso,
+            metadata.taken_at,
+            metadata.camera_model,
+            metadata.focal_35mm,
+          ],
+          (err) => {
+            if (!err) console.log(filename + " 메타데이터 등록 완료!");
+          },
+        );
+      }
+      // --- [메타데이터 추출 및 저장 로직 끝] ---
+
+      res.send("사진과 촬영 정보가 게시판에 등록되었습니다!");
+    },
+  );
 });
 
 /**
